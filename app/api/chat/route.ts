@@ -20,6 +20,65 @@ interface FrontendMessage {
 
 interface ChatRequest {
   messages: FrontendMessage[];
+  turnstileToken?: string;
+}
+
+// 通用：带代理的 fetch（失败自动回退直连）
+async function fetchWithProxy(url: string, options: RequestInit, timeoutMs: number = 15000): Promise<Response> {
+  const proxyUrl = 'http://127.0.0.1:7897';
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    if (ProxyAgent && undici) {
+      console.log('🔌 使用代理请求:', url);
+      const agent = new ProxyAgent({
+        uri: proxyUrl,
+        connect: {
+          timeout: timeoutMs,
+          rejectUnauthorized: false
+        }
+      });
+
+      const undiciFetch = undici.fetch as any;
+      const finalOpts: any = {
+        ...options,
+        dispatcher: agent,
+        signal: controller.signal
+      };
+      const response = await undiciFetch(url, finalOpts);
+      clearTimeout(timeoutId);
+      console.log('✅ 代理请求成功:', url);
+      return response as Response;
+    }
+
+    console.warn('⚠️ 无 ProxyAgent，直连请求:', url);
+    const directOpts: any = {
+      ...options,
+      signal: controller.signal
+    };
+    const response = await fetch(url, directOpts);
+    clearTimeout(timeoutId);
+    return response;
+  } catch (proxyError) {
+    clearTimeout(timeoutId);
+    console.warn('⚠️ 代理请求失败，回退直连:', url, '错误:', proxyError instanceof Error ? proxyError.message : String(proxyError));
+    // 回退直连
+    const controller2 = new AbortController();
+    const timeoutId2 = setTimeout(() => controller2.abort(), timeoutMs);
+    try {
+      const directOpts: any = {
+        ...options,
+        signal: controller2.signal
+      };
+      const response = await fetch(url, directOpts);
+      clearTimeout(timeoutId2);
+      return response;
+    } catch (directError) {
+      clearTimeout(timeoutId2);
+      throw directError;
+    }
+  }
 }
 
 function extractTextFromFullResponse(jsonObj: any): string | null {
@@ -43,7 +102,53 @@ export async function POST(request: NextRequest) {
   console.log('\n=========================================');
   console.log('🚀 新请求到达 /api/chat');
   try {
-    const { messages }: ChatRequest = await request.json();
+    const { messages, turnstileToken }: ChatRequest = await request.json();
+
+    // ============ Turnstile 校验逻辑 开始 ============
+    if (!turnstileToken) {
+      return NextResponse.json(
+        { content: "⚠️ 请完成人机验证后再发起对话" },
+        { status: 403 }
+      );
+    }
+
+    console.log('🔐 正在校验 Turnstile Token...');
+    let verifyResult: any = null;
+    try {
+      const verifyRes = await fetchWithProxy(
+        "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            secret: process.env.TURNSTILE_SECRET_KEY!,
+            response: turnstileToken,
+          }),
+        },
+        8000 // Turnstile 校验超时 8 秒
+      );
+      verifyResult = await verifyRes.json();
+      console.log('📝 Turnstile 校验结果:', JSON.stringify(verifyResult));
+    } catch (verifyError) {
+      console.error('❌ Turnstile 校验请求异常:', verifyError);
+      // 网络超时/代理问题时，给出明确提示
+      return NextResponse.json(
+        { content: "⚠️ 人机验证超时，请检查网络后刷新重试" },
+        { status: 403 }
+      );
+    }
+
+    if (!verifyResult || !verifyResult.success) {
+      const errorCodes = verifyResult?.['error-codes'] || [];
+      console.warn('⚠️ Turnstile 校验失败，错误码:', errorCodes);
+      return NextResponse.json(
+        { content: "⚠️ 人机验证失效，请刷新页面重新验证" },
+        { status: 403 }
+      );
+    }
+    console.log('✅ Turnstile 校验通过');
+    // ============ Turnstile 校验逻辑 结束 ============
+
     console.log('📝 收到前端消息:', JSON.stringify(messages, null, 2));
 
     const apiKey = process.env.APIMART_API_KEY;
@@ -75,41 +180,15 @@ export async function POST(request: NextRequest) {
     console.log('  URL:', endpoint);
     console.log('  Body:', JSON.stringify(requestBody, null, 2));
 
-    let response;
-    const proxyUrl = 'http://127.0.0.1:7897'; // 固定代理
-
-    if (ProxyAgent && undici) {
-      console.log('🔌 强制使用代理:', proxyUrl);
-      const agent = new ProxyAgent({
-        uri: proxyUrl,
-        connect: {
-          timeout: 15000,
-          rejectUnauthorized: false
-        }
-      });
-      console.log('✅ ProxyAgent 创建成功');
-
-      const undiciFetch = undici.fetch;
-      response = await undiciFetch(endpoint, {
-        method: 'POST',
-        dispatcher: agent,
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer ' + apiKey
-        },
-        body: JSON.stringify(requestBody)
-      });
-    } else {
-      console.warn('⚠️ 无 ProxyAgent，尝试直连');
-      response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer ' + apiKey
-        },
-        body: JSON.stringify(requestBody)
-      });
-    }
+    console.log('� 开始调用 APIMart API...');
+    const response = await fetchWithProxy(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + apiKey
+      },
+      body: JSON.stringify(requestBody)
+    }, 30000); // APIMart 超时 30 秒
 
     console.log('📥 APIMart 响应状态:', response.status, response.statusText);
     if (!response.ok) {

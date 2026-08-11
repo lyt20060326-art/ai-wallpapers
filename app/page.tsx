@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useRef, useEffect, useCallback } from 'react';
+import { Turnstile } from '@marsidev/react-turnstile';
 
 interface Message {
   id: string;
@@ -13,7 +14,10 @@ export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [turnstileToken, setTurnstileToken] = useState('');
+  const [verifyTip, setVerifyTip] = useState(''); // 人机验证提示文案
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const turnstileSiteKey = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY;
 
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -27,19 +31,24 @@ export default function Home() {
     e.preventDefault();
     if (!input.trim() || isLoading) return;
 
+    // 人机验证拦截
+    if (!turnstileToken) {
+      setVerifyTip('请先完成下方人机验证');
+      return;
+    }
+    setVerifyTip('');
+
     const userMessage: Message = {
       id: Date.now().toString(),
       role: 'user',
       content: input,
     };
 
-    // 添加用户消息
     setMessages(prev => [...prev, userMessage]);
     const currentInput = input;
     setInput('');
     setIsLoading(true);
 
-    // 添加空的 AI 消息占位符
     const aiMessageId = (Date.now() + 1).toString();
     setMessages(prev => [...prev, {
       id: aiMessageId,
@@ -54,9 +63,18 @@ export default function Home() {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ messages: [...messages, userMessage] }),
+        body: JSON.stringify({
+          messages: [...messages, userMessage],
+          turnstileToken,
+        }),
       });
 
+      // 后端返回403=人机验证失效，清空token提示重新验证
+      if (response.status === 403) {
+        setTurnstileToken('');
+        setVerifyTip('验证已失效，请重新完成人机验证');
+        throw new Error('人机验证过期');
+      }
       if (!response.ok) {
         throw new Error('Network response was not ok');
       }
@@ -64,7 +82,6 @@ export default function Home() {
       const contentType = response.headers.get('content-type') || '';
       
       if (contentType.includes('text/event-stream')) {
-        // 处理 SSE 流式响应，保留跨 chunk 的残余数据，避免丢帧
         const reader = response.body?.getReader();
         const decoder = new TextDecoder();
         let fullText = '';
@@ -87,16 +104,7 @@ export default function Home() {
                   try {
                     const data = JSON.parse(dataStr);
                     if (data.content) {
-                      // 兼容“增量片段”和“完整文本快照”两种后端透传模式
-                      if (
-                        typeof data.content === 'string' &&
-                        data.content.length >= fullText.length &&
-                        data.content.startsWith(fullText)
-                      ) {
-                        fullText = data.content;
-                      } else {
-                        fullText += data.content;
-                      }
+                      fullText += data.content;
                       setMessages(prev => prev.map(msg => 
                         msg.id === aiMessageId 
                           ? { ...msg, content: fullText }
@@ -115,15 +123,7 @@ export default function Home() {
               try {
                 const data = JSON.parse(finalLine.slice(6));
                 if (data.content) {
-                  if (
-                    typeof data.content === 'string' &&
-                    data.content.length >= fullText.length &&
-                    data.content.startsWith(fullText)
-                  ) {
-                    fullText = data.content;
-                  } else {
-                    fullText += data.content;
-                  }
+                  fullText += data.content;
                   setMessages(prev => prev.map(msg =>
                     msg.id === aiMessageId
                       ? { ...msg, content: fullText }
@@ -139,7 +139,6 @@ export default function Home() {
           }
         }
       } else {
-        // 处理非流式响应（备用方案）
         const data = await response.json();
         if (data.content) {
           setMessages(prev => prev.map(msg => 
@@ -151,7 +150,6 @@ export default function Home() {
       }
     } catch (error) {
       console.error('Error:', error);
-      // 出错时更新消息为错误提示
       setMessages(prev => prev.map(msg => 
         msg.id === aiMessageId 
           ? { ...msg, content: '抱歉，发生了错误，请稍后重试。', isStreaming: false }
@@ -159,7 +157,6 @@ export default function Home() {
       ));
     } finally {
       setIsLoading(false);
-      // 标记流式结束
       setMessages(prev => prev.map(msg => 
         msg.id === aiMessageId 
           ? { ...msg, isStreaming: false }
@@ -225,11 +222,45 @@ export default function Home() {
             />
             <button
               type="submit"
-              disabled={isLoading || !input.trim()}
+              disabled={isLoading || !input.trim() || !turnstileToken}
               className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-full px-6 py-3 font-medium transition-colors"
             >
               发送
             </button>
+          </div>
+          {/* 提示文案 */}
+          {verifyTip && <p className="text-red-400 text-sm mt-2 text-center">{verifyTip}</p>}
+          {/* 固定最小高度，防止页面抖动 */}
+          <div className="mt-3 flex justify-center min-h-[70px] items-center">
+            {turnstileSiteKey ? (
+              <Turnstile
+                siteKey={turnstileSiteKey}
+                onSuccess={(token) => {
+                  setTurnstileToken(token);
+                  setVerifyTip('');
+                }}
+                onExpire={() => {
+                  setTurnstileToken('');
+                  setVerifyTip('验证超时，请重新验证');
+                }}
+                onError={() => {
+                  setTurnstileToken('');
+                  setVerifyTip('验证出错，请刷新重试');
+                }}
+              />
+            ) : (
+              <div className="text-center py-2 px-4 border-2 border-dashed border-yellow-500 bg-yellow-900/20 rounded-lg">
+                <p className="text-yellow-400 text-sm font-semibold">
+                  ⚠️ 缺少 NEXT_PUBLIC_TURNSTILE_SITE_KEY 环境变量
+                </p>
+                <p className="text-gray-300 text-xs mt-1">
+                  本地开发：请检查 .env.local 是否配置了该变量
+                </p>
+                <p className="text-gray-300 text-xs">
+                  Vercel 部署：请在项目后台 Settings → Environment Variables 添加
+                </p>
+              </div>
+            )}
           </div>
         </form>
       </footer>
